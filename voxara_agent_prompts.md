@@ -869,11 +869,223 @@ DONE CRITERIA:
 
 ---
 
+## PHASE 9 — Listings Intelligence Extension
+
+```
+Context: Voxara project. Build ONLY after Phases 2-8 are complete and validated —
+this phase attaches new nodes onto the existing extract_data_node/graph rather
+than replacing anything. Decisions already made (do not re-litigate): images go
+to S3-compatible object storage, the listings DB is PostgreSQL, and caller-facing
+WhatsApp sends use a pre-approved Twilio/WhatsApp Content Template (callers are
+outside the 24h free-form messaging window since they only phoned, never
+WhatsApp'd in).
+
+GOAL: the agent WhatsApps a flat's photos + caption to Voxara once. Voxara stores
+it. On every future call, once Voxara has extracted what the caller wants, it
+matches against stored listings and WhatsApps the matching photos + info
+DIRECTLY TO THE CALLER, on top of the existing agent-facing summary.
+
+TASK A: Database layer
+
+CREATE app/models/listing.py — a SQLModel table model `Listing`:
+  id, agent_number, raw_caption, property_type, location, price_text,
+  price_min (int, nullable), price_max (int, nullable), bedrooms, furnishing,
+  amenities (JSON column — portable type, not Postgres-only JSONB, so the same
+  model works against SQLite in tests and Postgres in prod), image_urls (JSON
+  list of strings), listing_summary, availability_status (default "available"),
+  message_sid, created_at.
+
+CREATE app/services/db.py — sync SQLAlchemy engine from settings.DATABASE_URL
+  (postgresql+psycopg2://...) + a get_session() context manager. Stay SYNC here,
+  wrapped in run_in_executor like every other service — do NOT introduce an
+  async DB driver, it would be the only inconsistent I/O path in an otherwise
+  fully sync-wrapped codebase.
+
+ADD to app/config.py / .env.example:
+  DATABASE_URL=
+  S3_ENDPOINT_URL=
+  S3_ACCESS_KEY_ID=
+  S3_SECRET_ACCESS_KEY=
+  S3_BUCKET_NAME=
+  S3_REGION=
+  S3_PUBLIC_BASE_URL=
+  TWILIO_LISTING_TEMPLATE_SID=
+  MAX_LISTINGS_PER_MATCH=3
+  LISTING_MATCH_MIN_SCORE=40
+
+ADD to docker-compose.yml a `postgres` service + named volume; app service gets
+  `depends_on: [postgres]`.
+
+SET UP alembic/ with one initial migration creating the listings table. Never
+  run `alembic upgrade head` automatically inside the app container when using
+  --workers 2 — migrate as an explicit pre-deploy step to avoid concurrent-
+  migration races.
+
+ADD to requirements.txt: sqlmodel==0.0.22, psycopg2-binary==2.9.9,
+  alembic==1.13.3, boto3==1.35.0
+
+TASK B: Storage service
+
+CREATE app/services/storage_service.py:
+  async def download_twilio_media(media_url: str) -> tuple[bytes, str]
+    - Twilio media URLs require HTTP Basic Auth: httpx.AsyncClient().get(
+      media_url, auth=(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN))
+  async def upload_image(image_bytes: bytes, content_type: str, key: str) -> str
+    - Sync boto3 put_object wrapped in run_in_executor, returns a stable public
+      HTTPS URL under settings.S3_PUBLIC_BASE_URL
+    - Gotcha: modern S3 buckets default to ACLs disabled — use a bucket policy
+      scoped to the `listings/` prefix, do NOT pass ACL="public-read"
+
+TASK C: Inbound WhatsApp webhook (agent uploads a listing)
+
+ADD to app/main.py:
+  POST /webhook/whatsapp/inbound, rate-limited @limiter.limit("20/minute")
+  - Twilio sends form-encoded (not JSON): From, Body, NumMedia, MediaUrl0..N,
+    MediaContentType0..N
+  - Validate Twilio's request signature FIRST (app/utils/validators.py::
+    validate_twilio_signature, using twilio.request_validator.RequestValidator)
+  - Respond with empty TwiML immediately; do real work via BackgroundTasks —
+    Twilio's webhook timeout is short and will retry on timeout, don't block it
+    on image downloads/S3/Groq
+
+CREATE app/services/whatsapp_webhook_service.py::handle_inbound_whatsapp(form: dict) -> dict
+  - if form["From"] != settings.AGENT_WHATSAPP_NUMBER: silently return {"ignored": True}
+  - if NumMedia == 0: return {"ignored": True, "reason": "no_media"}
+  - download each media item, upload each to S3, extract caption via Groq
+    (TASK D), store the listing (TASK A's Listing model)
+
+TASK D: Listing extraction
+
+CREATE app/prompts/listing_prompt.py::LISTING_EXTRACTION_SYSTEM_PROMPT — mirrors
+  EXTRACTION_SYSTEM_PROMPT's style, schema: property_type, location, price_text,
+  bedrooms, furnishing, amenities (array), listing_summary, availability_status
+  ("available | sold | rented | unknown"). Null when undeterminable, never
+  hallucinate.
+
+ADD to app/services/groq_service.py::extract_listing_data(caption: str) -> dict
+  - same model/temperature/retry/thread-executor conventions as extract_call_data
+
+CREATE app/utils/budget_parser.py::parse_budget_to_range(text: str) -> tuple[int|None, int|None]
+  - deterministic, NOT another LLM call: "80 lakhs" -> (8000000, 8000000),
+    "50L-70L" -> (5000000, 7000000), "1.2 crore" -> (12000000, 12000000),
+    unparsable -> (None, None). Used both at ingestion (on price_text) and at
+    match time (on the caller's extracted budget).
+
+TASK E: Matching logic
+
+ADD to app/services/listing_service.py::match_listings(preferences: dict,
+  listings: list, max_results=3, min_score=40) -> list[dict]
+  - a PURE function, no I/O, no DB, no network — this is what makes it
+    exhaustively unit-testable with zero mocks
+  - weighted scoring: location (40, case-insensitive substring/token overlap),
+    property_type (30, normalized exact match e.g. "2 bhk" -> "2bhk"),
+    bedrooms (15, exact or +/-1), budget (15, normalized range overlap;
+    unparsable = neutral, don't exclude)
+  - filter to availability_status == "available", sort by score desc, drop
+    below min_score, cap at max_results
+  - Rule-based, NOT LLM-based: no extra Groq round-trip, deterministic and
+    testable, plenty for a single agent's dozens-to-low-hundreds of listings
+
+TASK F: LangGraph integration
+
+EXTEND app/services/vapi_service.py's VapiCall model with a `customer:
+  Optional[VapiCustomer]` sub-model (`.number`) to capture the CALLER's own
+  phone number — the existing `phoneNumber` field is Voxara's own number, not
+  the caller's. Verify the exact field name against Vapi's current webhook
+  payload before relying on it.
+
+EXTEND VoxaraState (app/graph/voxara_graph.py) with:
+  caller_whatsapp_number: Optional[str]
+  matched_listings: Optional[List[dict]]
+  listings_send_result: Optional[dict]
+
+CREATE app/agents/listing_agent.py:
+  async def match_listings_node(state) -> dict
+    - fast-path return {"matched_listings": []} unless intent is
+      property_inquiry/site_visit_request AND property_type or
+      location_preference is present
+  def should_send_listings(state) -> str
+    - "skip" if state["status"] == "failed" or no matched_listings, else "send"
+  async def send_listings_node(state) -> dict
+    - if no caller_whatsapp_number: return {"success": False, "error":
+      "NO_CALLER_NUMBER"} — degrade gracefully, never crash (web test calls /
+      withheld caller ID have no customer number)
+
+REWIRE app/graph/voxara_graph.py (should_schedule_meeting stays UNCHANGED,
+  only its "notify_without_meeting" target moves):
+  extract --(should_schedule_meeting)--> {
+      "notify_with_meeting":    schedule_meeting,
+      "notify_without_meeting": match_listings,      # was: send_whatsapp
+      "failed": END,
+  }
+  schedule_meeting -> match_listings                 # NEW edge
+  match_listings --(should_send_listings)--> {
+      "send": send_listings,
+      "skip": send_whatsapp,
+  }
+  send_listings -> send_whatsapp                     # NEW edge
+  send_whatsapp -> finalize -> END
+
+TASK G: Outbound send to the caller
+
+ADD to app/services/whatsapp_service.py::send_listing_template_message(to_number,
+  listing: dict) -> dict — same never-raise/always-return-dict contract as
+  send_summary_to_agent, but uses content_sid=settings.TWILIO_LISTING_TEMPLATE_SID
+  + content_variables instead of a free-form body. One message PER matched
+  listing (capped at settings.MAX_LISTINGS_PER_MATCH) — WhatsApp template
+  headers support exactly one media item, so a multi-listing gallery in one
+  message isn't possible.
+
+Proposed template body (submit via Twilio Content API for Meta approval WELL
+before go-live — turnaround is hours-to-days, and editing the approved body
+later requires re-approval):
+  Header: [IMAGE — {{1}}]
+  Hi {{2}}! Following up on your inquiry — here's a property that matches
+  what you're looking for:
+  🏠 {{3}} in {{4}}   💰 Budget: {{5}}   🛏️ Bedrooms: {{6}}
+  {{7}}
+  Reply to this message or call us back to schedule a visit!
+
+CREATE scripts/setup_whatsapp_template.py (mirrors scripts/setup_vapi_assistant.py)
+  - submits the template via Twilio's Content API, prints the returned
+    ContentSid to save as TWILIO_LISTING_TEMPLATE_SID
+
+DONE CRITERIA:
+- python -c "from app.services.listing_service import match_listings" and call
+  it directly against hand-built dicts (no mocks needed) — confirms scoring
+  logic without touching a DB
+- python -c "from app.utils.budget_parser import parse_budget_to_range" against
+  "80 lakhs", "50L-70L", "1.2 crore", and garbage input — confirms deterministic
+  normalization
+- pytest tests/test_listing_ingestion.py tests/test_matching.py
+  tests/test_graph_listings.py — all pass, everything external mocked (Groq,
+  Twilio, boto3, DB session)
+- docker-compose up — postgres healthy, app connects, alembic upgrade head run
+  manually once, GET /health still returns ok
+- Manual: WhatsApp an image + caption from the agent's number to the Twilio
+  sandbox number -> a row appears in the listings table with an S3 URL. Then
+  run scripts/test_call.py with a transcript matching that listing -> confirm
+  matched_listings is non-empty and (once the template is approved) a WhatsApp
+  message arrives at a test "caller" number
+
+OPEN RISKS (flagged, not blocking):
+- Vapi's exact field for the caller's number needs checking against live
+  docs/a real payload — field naming has shifted across Vapi API versions
+- Twilio/Meta template approval is manual and out-of-band; the listings
+  message may get classified as Marketing rather than Utility category
+- Twilio signature validation breaks silently behind ngrok/reverse proxies if
+  the reconstructed URL doesn't exactly match what's configured in console
+- BackgroundTasks work is lost on process crash/restart — fine for MVP, a real
+  queue (Celery/RQ) would be needed at scale
+```
+
+---
+
 ## MASTER CHECKLIST
 
 Before going live, verify every item:
 
-- [ ] All 8 phases complete with zero errors
+- [ ] All 8 core phases complete with zero errors
 - [ ] `.env` filled with real credentials — never commit this file
 - [ ] Groq API key tested — both STT and LLM responding correctly
 - [ ] Vapi assistant created: `python scripts/setup_vapi_assistant.py`
@@ -885,6 +1097,15 @@ Before going live, verify every item:
 - [ ] Meeting test: say a date/time during call → Google Calendar event created
 - [ ] All 4 pytest tests passing cleanly
 - [ ] Docker container builds and `/health` returns `ok`
+
+**Phase 9 (listings extension) — optional, build after the above:**
+
+- [ ] Postgres running, `alembic upgrade head` applied
+- [ ] S3 bucket created, `listings/` prefix has a public-read bucket policy
+- [ ] Agent WhatsApp upload → listing appears in DB with an S3 image URL
+- [ ] `match_listings()` and `parse_budget_to_range()` unit-tested with zero mocks
+- [ ] Twilio/Meta WhatsApp Content Template submitted and approved
+- [ ] End-to-end: call matching a stored listing → caller receives a WhatsApp with photo + info
 
 ---
 
