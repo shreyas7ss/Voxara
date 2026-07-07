@@ -1,5 +1,10 @@
+import sys
+from pathlib import Path
+
 import httpx
 from dotenv import set_key
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings
 

@@ -52,18 +52,6 @@ agent's summary, without changing the existing routing logic.
 
 **Build status** — see `voxara_agent_prompts.md` for the full phase-by-phase spec:
 
-| Phase | What | Status |
-|---|---|---|
-| 1 | Project scaffold & environment | ✅ done |
-| 2 | Groq service (STT + LLM) | ✅ done |
-| 3 | WhatsApp & Google Calendar services | ✅ done |
-| 4 | LangGraph agents & state machine | ⬜ not started |
-| 5 | Vapi webhook & FastAPI server | ⬜ not started |
-| 6 | Vapi assistant configuration | ⬜ not started |
-| 7 | End-to-end testing | ⬜ not started |
-| 8 | Production hardening & deployment | ⬜ not started |
-| 9 | Listings intelligence extension | ⬜ planned (design approved, not built) |
-
 ## Quick Start
 
 ```bash
