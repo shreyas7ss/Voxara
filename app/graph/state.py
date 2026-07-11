@@ -11,3 +11,8 @@ class VoxaraState(TypedDict):
     calendar_result: Optional[dict]
     errors: List[str]
     status: str
+
+    # Phase 9 — listings extension
+    caller_whatsapp_number: Optional[str]
+    matched_listings: Optional[List[dict]]
+    listings_send_result: Optional[dict]

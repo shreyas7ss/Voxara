@@ -35,8 +35,15 @@ async def handle_vapi_webhook(payload: VapiWebhookPayload) -> dict:
         logger.warning(f"Empty transcript for call {call_id}")
         return {"call_id": call_id, "status": "skipped", "reason": "empty_transcript"}
 
+    caller_number = payload.call.customer.number if payload.call.customer else None
+    caller_whatsapp_number = f"whatsapp:{caller_number}" if caller_number else None
+
     from app.graph.voxara_graph import process_call
-    final_state = await process_call(call_id=call_id, transcript=transcript)
+    final_state = await process_call(
+        call_id=call_id,
+        transcript=transcript,
+        caller_whatsapp_number=caller_whatsapp_number,
+    )
 
     return {
         "call_id": call_id,
