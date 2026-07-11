@@ -1,3 +1,5 @@
+import asyncio
+
 from pydantic import BaseModel
 from typing import Optional
 
@@ -39,11 +41,18 @@ async def handle_vapi_webhook(payload: VapiWebhookPayload) -> dict:
     caller_whatsapp_number = f"whatsapp:{caller_number}" if caller_number else None
 
     from app.graph.voxara_graph import process_call
-    final_state = await process_call(
-        call_id=call_id,
-        transcript=transcript,
-        caller_whatsapp_number=caller_whatsapp_number,
-    )
+    try:
+        final_state = await asyncio.wait_for(
+            process_call(
+                call_id=call_id,
+                transcript=transcript,
+                caller_whatsapp_number=caller_whatsapp_number,
+            ),
+            timeout=25,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"process_call timed out for call {call_id}")
+        return {"call_id": call_id, "status": "timeout", "errors": ["PROCESS_CALL_TIMEOUT"]}
 
     return {
         "call_id": call_id,

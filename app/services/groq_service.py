@@ -10,7 +10,7 @@ from app.prompts.extraction_prompt import EXTRACTION_SYSTEM_PROMPT, WHATSAPP_SUM
 from app.prompts.listing_prompt import LISTING_EXTRACTION_SYSTEM_PROMPT
 from app.utils.logger import logger
 
-client = Groq(api_key=settings.GROQ_API_KEY)
+client = Groq(api_key=settings.GROQ_API_KEY, timeout=30.0)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=0.5, max=4))
@@ -32,6 +32,7 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/wav") -> 
         raise RuntimeError("STT_FAILED")
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=0.5, max=4))
 def _sync_extract(transcript: str) -> str:
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -67,6 +68,7 @@ async def extract_call_data(transcript: str) -> dict:
     return parsed
 
 
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=0.5, max=4))
 def _sync_extract_listing(caption: str) -> str:
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",

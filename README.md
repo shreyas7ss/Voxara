@@ -14,16 +14,20 @@ meeting was requested. Voxara then creates a Google Calendar event if needed
 and WhatsApps the agent a formatted summary, so the agent never has to listen
 to a recording or read a raw transcript.
 
-A planned extension (**Phase 9**, see [Architecture](#architecture)) lets the
-agent WhatsApp property listings (photos + caption) to Voxara once; on future
+**Phase 9** (see [Architecture](#architecture)) extends this: the agent
+WhatsApps property listings (photos + caption) to Voxara once; on future
 calls, Voxara matches caller preferences against those listings and WhatsApps
-matching photos directly to the caller.
+matching photos directly to the caller. The pipeline, Postgres wiring, and
+tests are all built and verified — what's left before real traffic is an S3
+bucket and an approved WhatsApp Content Template, both third-party account
+setup that can't be done from code (see
+[Phase 9](#phase-9--listings-intelligence-extension)).
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph P9["Phase 9 — Listings ingestion (planned, separate flow)"]
+    subgraph P9["Phase 9 — Listings ingestion (built, separate flow)"]
         L1[Agent WhatsApps flat photos + caption to Voxara]
         L2[Images uploaded to S3, caption parsed by Groq]
         L3[(Stored in Postgres listings DB)]
@@ -61,8 +65,8 @@ agent's summary, without changing the existing routing logic.
 | 5 | Vapi webhook & FastAPI server | ✅ done |
 | 6 | Vapi assistant configuration | ✅ done |
 | 7 | End-to-end testing | ✅ done |
-| 8 | Production hardening & deployment | ⬜ not started |
-| 9 | Listings intelligence extension | 🚧 in progress — see [Phase 9](#phase-9--listings-intelligence-extension) |
+| 8 | Production hardening & deployment | ✅ done |
+| 9 | Listings intelligence extension | ✅ built & tested — see [Phase 9](#phase-9--listings-intelligence-extension) |
 
 ## Quick Start
 
@@ -133,17 +137,54 @@ it matches those preferences against stored listings and WhatsApps matching
 photos **directly to the caller**, on top of the existing agent-facing summary.
 
 Full design rationale lives in `voxara_agent_prompts.md` (Phase 9 section).
-Current build status of the sub-steps:
+All sub-steps are built and covered by tests; what remains is standing up
+real infrastructure (Postgres, an S3 bucket, an approved WhatsApp template)
+before it can run against live traffic:
 
 | Step | What | Status |
 |---|---|---|
 | 9a | Database layer — `Listing` model, `db.py`, Alembic migration, Postgres in `docker-compose.yml` | ✅ done |
 | 9b | Storage service — S3 upload + authenticated Twilio media download | ✅ done |
-| 9c | Inbound WhatsApp webhook (agent uploads a listing) | ⬜ not started |
-| 9d | Listing extraction — prompt, `groq_service.extract_listing_data`, budget parser | 🚧 in progress |
-| 9e | Matching logic + LangGraph integration (`match_listings`, `send_listings` nodes) | ⬜ not started |
-| 9f | Outbound send — WhatsApp Content Template + `scripts/setup_whatsapp_template.py` | ⬜ not started |
-| 9g | Tests for the above | ⬜ not started |
+| 9c | Inbound WhatsApp webhook (agent uploads a listing) | ✅ done |
+| 9d | Listing extraction — prompt, `groq_service.extract_listing_data`, budget parser | ✅ done |
+| 9e | Matching logic + LangGraph integration (`match_listings`, `send_listings` nodes) | ✅ done |
+| 9f | Outbound send — WhatsApp Content Template + `scripts/setup_whatsapp_template.py` | ✅ done |
+| 9g | Tests for the above | ✅ done — 21 new tests across 3 files |
+
+### How it slots into the graph
+
+`match_listings` and `send_listings` sit between the meeting branch and the
+agent's summary, so a single call can now trigger up to three outcomes:
+a calendar event, a listings WhatsApp to the **caller**, and the summary
+WhatsApp to the **agent**:
+
+```
+extract --(should_schedule_meeting)--> schedule_meeting / match_listings / END
+schedule_meeting -> match_listings
+match_listings --(should_send_listings)--> send_listings / send_whatsapp
+send_listings -> send_whatsapp -> finalize -> END
+```
+
+`match_listings_node` only queries the DB when the call's intent is
+`property_inquiry`/`site_visit_request` and a property type or location was
+extracted — everything else short-circuits to an empty match list without
+touching the database. `send_listings_node` degrades to
+`{"success": False, "error": "NO_CALLER_NUMBER"}` rather than crashing when
+Vapi didn't supply the caller's own number (web test calls, withheld caller ID).
+
+### New files
+
+- `app/models/listing.py` — the `Listing` SQLModel table
+- `app/services/db.py` — SQLAlchemy session, kept sync + thread-executor-wrapped like every other service
+- `app/services/storage_service.py` — S3 upload + authenticated Twilio media download
+- `app/services/listing_service.py` — DB CRUD plus the pure, zero-mock-needed `match_listings()` scoring function
+- `app/services/whatsapp_webhook_service.py` — inbound webhook orchestration (ack fast, process via `BackgroundTasks`)
+- `app/agents/listing_agent.py` — `match_listings_node`, `should_send_listings`, `send_listings_node`
+- `app/prompts/listing_prompt.py`, `app/utils/budget_parser.py`
+- `app/utils/validators.py` — Twilio request-signature validation
+- `alembic/` — one migration, `create_listings_table`
+- `scripts/setup_whatsapp_template.py` — submits the Content Template, saves `TWILIO_LISTING_TEMPLATE_SID`
+- `tests/test_listing_ingestion.py`, `tests/test_matching.py`, `tests/test_graph_listings.py`, `tests/conftest.py`
 
 ### Database setup
 
@@ -198,18 +239,52 @@ ngrok http 8000
 # copy the https URL into the Vapi assistant's serverUrl
 ```
 
+## Production Hardening (Phase 8)
+
+- **Rate limiting** — `POST /webhook/vapi` (100/minute) and `POST /webhook/whatsapp/inbound`
+  (20/minute) are both limited via `slowapi`, keyed by remote address, returning `429`
+  once exceeded. **Caveat verified in practice**: the Docker image runs `uvicorn` with
+  2 workers, and slowapi's default in-memory storage doesn't share state across worker
+  processes — so the *effective* limit under `--workers N` is closer to `N ×` the
+  configured number before every worker independently starts rejecting. Fine for a
+  single-agent deployment; if you scale workers up meaningfully, point slowapi at a
+  shared store (e.g. `Limiter(storage_uri="redis://...")`) instead.
+- **Groq resilience** — `client = Groq(api_key=..., timeout=30.0)`; the sync helpers
+  behind `transcribe_audio`, `extract_call_data`, and `extract_listing_data` all retry
+  transient failures via `tenacity` (3 attempts, exponential backoff) before giving up.
+- **Call-processing timeout** — `handle_vapi_webhook` wraps `process_call(...)` in
+  `asyncio.wait_for(..., timeout=25)`; a stuck pipeline returns
+  `{"status": "timeout", "errors": ["PROCESS_CALL_TIMEOUT"]}` instead of hanging the
+  webhook response indefinitely.
+
 ## Running with Docker
 
 ```bash
 docker build -t voxara .
-docker-compose up
+docker-compose up -d
+docker compose exec voxara alembic upgrade head   # explicit migration step, see below
 ```
+
+`docker-compose.yml` runs two services: `voxara` (the app, built from the
+`Dockerfile`, healthchecked via `curl http://localhost:8000/health`) and
+`postgres` (16-alpine, with its own healthcheck) — `voxara` waits for
+`postgres` to report healthy before starting, and its `DATABASE_URL` is
+overridden in-compose to point at the `postgres` service hostname regardless
+of what's in your local `.env`. Verified end-to-end: `docker build` completes
+clean, both containers report healthy, `/health` returns `200` from the host,
+and `alembic upgrade head` applies correctly against the containerized Postgres.
 
 ## Running Tests
 
 ```bash
 pytest
 ```
+
+25 tests across `tests/test_integration.py` (core pipeline), `tests/test_matching.py`
+(budget parsing + listing scoring, no mocks needed), `tests/test_listing_ingestion.py`
+(inbound webhook), and `tests/test_graph_listings.py` (full graph topology with
+both the meeting and listings branches). `tests/conftest.py` creates the SQLite
+schema once per test session so DB-touching paths don't need Postgres running locally.
 
 ## Troubleshooting
 
@@ -222,3 +297,8 @@ pytest
   session window will fail for any number that hasn't messaged in.
 - **Calendar event not created** — check `GOOGLE_REFRESH_TOKEN` is set; it's
   only obtained after completing the `/auth/google` flow once.
+- **`sqlite3.OperationalError: no such table: listings`** — the DB schema
+  hasn't been created yet. Run `alembic upgrade head` (or, for a quick local
+  check, `python -c "from app.services.db import create_all; create_all()"`).
+  Every call now routes through `match_listings_node`, so this can surface
+  even on calls that have nothing to do with listings.

@@ -3,6 +3,10 @@ from fastapi.responses import JSONResponse, RedirectResponse, Response
 from typing import Optional
 from datetime import datetime
 
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
 from app.services.vapi_service import VapiWebhookPayload, handle_vapi_webhook
 from app.services.whatsapp_webhook_service import handle_inbound_whatsapp
 from app.services import calendar_service
@@ -12,9 +16,15 @@ from app.config import settings
 
 app = FastAPI(title="Voxara", version="1.0.0")
 
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 
 @app.post("/webhook/vapi")
+@limiter.limit("100/minute")
 async def vapi_webhook(
+    request: Request,
     payload: VapiWebhookPayload,
     x_vapi_secret: Optional[str] = Header(None)
 ):
@@ -25,6 +35,7 @@ async def vapi_webhook(
 
 
 @app.post("/webhook/whatsapp/inbound")
+@limiter.limit("20/minute")
 async def whatsapp_inbound_webhook(request: Request, background_tasks: BackgroundTasks):
     form = dict(await request.form())
 
