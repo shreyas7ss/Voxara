@@ -8,3 +8,4 @@ logs/
 token.json
 credentials.json
 .venv/
+voxara.db

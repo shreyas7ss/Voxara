@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     VAPI_API_KEY: str = ""
     VAPI_PHONE_NUMBER_ID: str = ""
     VAPI_ASSISTANT_ID: str = ""
+    VAPI_SERVER_URL: str = ""
+    VAPI_SERVER_CREDENTIAL_ID: str = ""
     VAPI_WEBHOOK_SECRET: str = ""
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
@@ -17,6 +19,7 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str = ""
     GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/google/callback"
     GOOGLE_REFRESH_TOKEN: str = ""
+    AGENT_CALENDAR_ID: str = "primary"
     PORT: int = 8000
     ENV: str = "development"
 
